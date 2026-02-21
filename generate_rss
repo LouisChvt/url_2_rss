@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""
+Générateur de flux RSS pour GitHub Actions
+Modifiez la section CONFIGURATION ci-dessous pour ajouter vos sites
+"""
+
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+import sys
+from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.dom import minidom
+from urllib.parse import urljoin, urlparse
+
+# ============================================
+# CONFIGURATION - Ajoutez vos sites ici !
+# ============================================
+
+SITES = [
+    {
+        'url': 'https://www.lemonde.fr',
+        'output': 'lemonde.xml',
+        'name': 'Le Monde'
+    },
+    {
+        'url': 'https://www.liberation.fr',
+        'output': 'liberation.xml',
+        'name': 'Libération'
+    },
+    # Ajoutez autant de sites que vous voulez :
+    # {
+    #     'url': 'https://www.20minutes.fr',
+    #     'output': '20minutes.xml',
+    #     'name': '20 Minutes'
+    # },
+]
+
+MAX_ITEMS = 15  # Nombre max d'articles par flux
+
+# ============================================
+# CODE - Ne pas modifier sauf si vous savez ce que vous faites
+# ============================================
+
+def clean_text(text):
+    """Nettoie le texte en enlevant les espaces superflus"""
+    return ' '.join(text.split()).strip()
+
+def extract_articles(soup, base_url):
+    """Extrait les articles d'une page"""
+    articles = []
+    
+    # Stratégie 1 : Chercher les balises <article>
+    for article_tag in soup.find_all('article', limit=MAX_ITEMS):
+        article_data = extract_article_data(article_tag, base_url)
+        if article_data:
+            articles.append(article_data)
+    
+    # Stratégie 2 : Si pas d'articles, chercher les divs communs
+    if not articles:
+        for div in soup.find_all('div', class_=['post', 'article', 'entry', 'item'], limit=MAX_ITEMS):
+            article_data = extract_article_data(div, base_url)
+            if article_data:
+                articles.append(article_data)
+    
+    # Stratégie 3 : Chercher tous les h2/h3
+    if not articles:
+        for heading in soup.find_all(['h2', 'h3'], limit=MAX_ITEMS):
+            title = clean_text(heading.get_text())
+            if len(title) < 15 or len(title) > 200:
+                continue
+            
+            # Chercher un lien
+            link = heading.find('a')
+            if link and link.get('href'):
+                url = urljoin(base_url, link['href'])
+            else:
+                url = base_url
+            
+            # Chercher une description
+            description = title
+            next_elem = heading.find_next_sibling('p')
+            if next_elem:
+                description = clean_text(next_elem.get_text())[:300]
+            
+            articles.append({
+                'title': title,
+                'link': url,
+                'description': description
+            })
+    
+    return articles[:MAX_ITEMS]
+
+def extract_article_data(element, base_url):
+    """Extrait les données d'un élément article"""
+    # Titre
+    title_tag = element.find(['h1', 'h2', 'h3', 'h4'])
+    if not title_tag:
+        return None
+    
+    title = clean_text(title_tag.get_text())
+    if len(title) < 15 or len(title) > 200:
+        return None
+    
+    # Lien
+    link_tag = element.find('a', href=True)
+    if link_tag:
+        link = urljoin(base_url, link_tag['href'])
+    else:
+        link = base_url
+    
+    # Description
+    description = title
+    for p_tag in element.find_all('p', limit=3):
+        text = clean_text(p_tag.get_text())
+        if len(text) > 50:
+            description = text[:400]
+            break
+    
+    return {
+        'title': title,
+        'link': link,
+        'description': description
+    }
+
+def generate_rss(site_config):
+    """Génère un flux RSS pour un site"""
+    url = site_config['url']
+    output_file = site_config['output']
+    site_name = site_config['name']
+    
+    print(f"\n📥 Génération du flux pour {site_name}...")
+    print(f"   URL : {url}")
+    
+    try:
+        # Récupérer la page
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        # Parser le HTML
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Extraire les articles
+        articles = extract_articles(soup, url)
+        
+        if not articles:
+            print(f"   ⚠️  Aucun article trouvé")
+            return False
+        
+        # Créer le flux RSS
+        rss = Element('rss', version='2.0', attrib={'xmlns:atom': 'http://www.w3.org/2005/Atom'})
+        channel = SubElement(rss, 'channel')
+        
+        # Métadonnées du canal
+        title_tag = soup.find('title')
+        channel_title = title_tag.string if title_tag else site_name
+        
+        SubElement(channel, 'title').text = channel_title
+        SubElement(channel, 'link').text = url
+        SubElement(channel, 'description').text = f"Flux RSS généré automatiquement depuis {site_name}"
+        SubElement(channel, 'language').text = 'fr'
+        SubElement(channel, 'lastBuildDate').text = datetime.now().strftime('%a, %d %b %Y %H:%M:%S +0000')
+        SubElement(channel, 'generator').text = 'RSS Generator via GitHub Actions'
+        
+        # Ajouter un lien atom:link (bonne pratique RSS)
+        atom_link = SubElement(channel, '{http://www.w3.org/2005/Atom}link')
+        atom_link.set('href', f'https://VOTRE-USERNAME.github.io/rss-feeds/{output_file}')
+        atom_link.set('rel', 'self')
+        atom_link.set('type', 'application/rss+xml')
+        
+        # Ajouter les articles
+        for article in articles:
+            item = SubElement(channel, 'item')
+            SubElement(item, 'title').text = article['title']
+            SubElement(item, 'link').text = article['link']
+            SubElement(item, 'description').text = article['description']
+            SubElement(item, 'pubDate').text = datetime.now().strftime('%a, %d %b %Y %H:%M:%S +0000')
+            SubElement(item, 'guid', isPermaLink='true').text = article['link']
+        
+        # Formater et sauvegarder
+        rough_string = tostring(rss, encoding='unicode')
+        reparsed = minidom.parseString(rough_string)
+        xml_content = reparsed.toprettyxml(indent="  ", encoding='utf-8').decode('utf-8')
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(xml_content)
+        
+        print(f"   ✅ {len(articles)} articles extraits → {output_file}")
+        return True
+        
+    except Exception as e:
+        print(f"   ❌ Erreur : {e}")
+        return False
+
+def main():
+    """Fonction principale"""
+    print("=" * 60)
+    print("🚀 GÉNÉRATION DES FLUX RSS")
+    print("=" * 60)
+    
+    success_count = 0
+    fail_count = 0
+    
+    for site in SITES:
+        if generate_rss(site):
+            success_count += 1
+        else:
+            fail_count += 1
+    
+    print("\n" + "=" * 60)
+    print(f"✅ Succès : {success_count}")
+    print(f"❌ Échecs : {fail_count}")
+    print("=" * 60)
+    
+    # Retourner un code d'erreur si tout a échoué
+    if success_count == 0:
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
